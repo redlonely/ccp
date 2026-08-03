@@ -123,12 +123,10 @@ async function fetchZhipuUsage(apiKey) {
 
   const parts = [];
   if (fiveHour) {
-    const reset = formatRemaining(fiveHour.nextResetTime - Date.now());
-    parts.push(`5h ${fiveHour.percentage}%${reset ? ` ↻${reset}` : ""}`);
+    parts.push(`5h ${fiveHour.percentage}%`);
   }
   if (sevenDay) {
-    const reset = formatRemaining(sevenDay.nextResetTime - Date.now());
-    parts.push(`周 ${sevenDay.percentage}%${reset ? ` ↻${reset}` : ""}`);
+    parts.push(`Wk ${sevenDay.percentage}%`);
   }
 
   return {
