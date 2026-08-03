@@ -6,11 +6,10 @@
 DB="$HOME/.cc-switch/cc-switch.db"
 GLOBAL_SETTINGS="$HOME/.claude/settings.json"
 HUD_DIR="$HOME/.claude/claude-hud"
-HUD_PLUGIN_DIR="$HOME/.claude/plugins/claude-hud"
 
 # ---- --check：环境自检（重装时有用）----
 if [ "$1" = "--check" ]; then
-  for cmd in cc-switch claude jq sqlite3 python3; do
+  for cmd in cc-switch claude jq sqlite3; do
     command -v "$cmd" >/dev/null || { echo "❌ $cmd missing"; exit 1; }
   done
   [ -f "$DB" ] || { echo "❌ cc-switch.db missing at $DB"; exit 1; }
@@ -33,7 +32,7 @@ set -- "${filtered[@]}"
 if [ -z "$1" ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
   echo "Usage: ccp [-d|--danger|--check] <provider> [claude args...]"
   echo "  -d, --danger   skip permission prompts (--dangerously-skip-permissions)"
-  echo "      --check    verify environment (cc-switch/claude/jq/sqlite3/python3)"
+  echo "      --check    verify environment (cc-switch/claude/jq/sqlite3)"
   echo ""
   echo "Available providers:"
   sqlite3 "$DB" "SELECT '  ' || name FROM providers WHERE app_type='claude' ORDER BY sort_index;" 2>/dev/null
@@ -94,28 +93,7 @@ if [ -f "$HUD_STATUSLINE" ]; then
     && mv "${SETTINGS_FILE}.tmp" "$SETTINGS_FILE"
 fi
 
-# ---- HUD marker：原子写 .current-<NAME>.json 给 claude-hud fetcher 读 ----
-# ccp 用临时 settings 启动 claude，~/.claude/settings.json 不反映真实 provider，
-# claude-hud 靠这个 marker 文件知道当前是哪个 provider。含 auth_token，0600 权限。
-HUD_MARKER="$HUD_PLUGIN_DIR/.current-${NAME// /_}.json"
-CCP_NAME="$NAME" SETTINGS_FILE="$SETTINGS_FILE" HUD_MARKER="$HUD_MARKER" python3 -c '
-import json, os, time
-cfg = json.load(open(os.environ["SETTINGS_FILE"]))
-env = cfg.get("env", {})
-marker = {
-    "name": os.environ["CCP_NAME"],
-    "base_url": env.get("ANTHROPIC_BASE_URL", ""),
-    "auth_token": env.get("ANTHROPIC_AUTH_TOKEN", ""),
-    "started_at": int(time.time()),
-}
-path = os.environ["HUD_MARKER"]
-os.makedirs(os.path.dirname(path), exist_ok=True)
-tmp = path + ".tmp." + str(os.getpid())
-with open(tmp, "w") as f:
-    json.dump(marker, f)
-os.chmod(tmp, 0o600)
-os.replace(tmp, path)
-' || echo "⚠️  HUD marker write failed (non-fatal)" >&2
-
 # ---- 启动：透传剩余参数 ----
+# 阶段1解耦：不再写 .current-<NAME>.json marker，fetcher 直接读 cc-switch.db。
+# claude-hud 按 stdin.model 路由 snapshot，不依赖 marker 知道当前 provider。
 exec claude --settings "$SETTINGS_FILE" $DANGER "$@"
