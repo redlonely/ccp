@@ -13,7 +13,6 @@ cc-switch GUI 切完 provider 后，**所有终端都被影响**（全局 curren
 |------|-----------|
 | **plugin 一致性** | 不同 provider 自带 `enabledPlugins` 不一样（GLM 27 项、DeepSeek 28 项、LemonFly 0 项），切到不同 provider 会**丢失 / 强制启用 plugin** |
 | **statusLine 强写** | cc-switch GUI 退出时可能用内存配置覆盖 db，把 claude-hud 的 statusLine 配置回滚掉 |
-| **HUD marker** | claude-hud 需要知道当前会话用哪个 provider，但 cc-switch 不感知 claude-hud 协议 |
 
 外加便利：
 - **模糊匹配**：`ccp glm` → `GLM`（cc-switch `start` 只支持精确大小写敏感匹配）
@@ -27,7 +26,7 @@ cc-switch GUI 切完 provider 后，**所有终端都被影响**（全局 curren
 |------|------------|------|
 | **macOS** | 其他 Unix 理论可行，未测 | — |
 | [**cc-switch**](https://github.com/farion1231/cc-switch) | ≥ 5.10（需要 `provider export` 子命令） | `brew install --cask cc-switch` |
-| [**claude-hud**](https://github.com/jarrodwatts/claude-hud) | 任意版本（用其 statusline + marker 协议） | 见其 README |
+| [**claude-hud**](https://github.com/jarrodwatts/claude-hud) | 任意版本（用其 statusline 协议） | 见其 README |
 | **Claude Code CLI** | 任意版本 | `pnpm add -g claude` 或参考官方文档 |
 | `jq` | 任意版本 | `brew install jq` |
 | `sqlite3` | macOS 自带 | — |
@@ -77,10 +76,11 @@ ccp <query>
   → cc-switch provider export <id> -o <tmp>           # 官方 API 生成 settings.json（schema 兼容由它保证）
   → jq 合并全局 enabledPlugins                        # 全局覆盖同名，保留 provider 专属
   → jq 注入 statusLine                                # 防 GUI 回滚
-  → 写 .current-<NAME>.json (atomic, 0600)            # claude-hud marker
   → exec claude --settings <tmp> [--dangerously-skip-permissions] [args...]
   → trap EXIT rm <tmp>                                # 退出时清理临时文件
 ```
+
+**claude-hud 额度显示**由独立的 `fetcher`（`adapters/fetch-provider-usage.mjs`）支撑：它直接读 `cc-switch.db` 拿所有 provider 的 token，调 API 查额度，写 `provider-usage-<name>.json` snapshot；claude-hud 按 `stdin.model` 路由到对应 snapshot 显示。
 
 设计文档：[`docs/specs/2026-08-03-ccp-rewrite-design.md`](./docs/specs/2026-08-03-ccp-rewrite-design.md)
 
@@ -91,8 +91,8 @@ ccp <query>
 **Q: 我不用 claude-hud，能用 ccp 吗？**
 A: 能跑，但 ccp 的核心价值打折。建议直接 `alias ccp='cc-switch start claude'` 一行解决。
 
-**Q: 切换后 claude-hud 状态栏没更新？**
-A: 检查 `~/.claude/plugins/claude-hud/.current-<NAME>.json` 是否存在、权限 0600、字段完整。ccp 启动时会写这个文件。
+**Q: 切换后 claude-hud 状态栏额度不刷新？**
+A: 检查 `~/.claude/plugins/claude-hud/provider-usage-<NAME>.json` 是否存在、`updated_at` 是否在 2 分钟内。fetcher 由 `watch-provider-switch.sh` 触发，最多 60 秒兜底刷新一次。手动刷新：`node ~/.claude/plugins/claude-hud/fetch-provider-usage.mjs`。
 
 **Q: plugin 跨 provider 还是漂移了？**
 A: 检查 `~/.claude/settings.json` 是否有 `enabledPlugins` 字段。ccp 是从这个文件合并到 provider 配置的，全局没配置就没合并效果。
