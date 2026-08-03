@@ -124,11 +124,11 @@ async function fetchZhipuUsage(apiKey) {
   const parts = [];
   if (fiveHour) {
     const reset = formatRemaining(fiveHour.nextResetTime - Date.now());
-    parts.push(`5h ${fiveHour.percentage}%${reset ? ` r${reset}` : ""}`);
+    parts.push(`5h ${fiveHour.percentage}%${reset ? ` in ${reset}` : ""}`);
   }
   if (sevenDay) {
     const reset = formatRemaining(sevenDay.nextResetTime - Date.now());
-    parts.push(`7d ${sevenDay.percentage}%${reset ? ` r${reset}` : ""}`);
+    parts.push(`7d ${sevenDay.percentage}%${reset ? ` in ${reset}` : ""}`);
   }
 
   return {
