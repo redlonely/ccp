@@ -51,8 +51,7 @@ function computeDailyUsage(currentBalance) {
 // 按 baseUrl 分发到对应查询；返回 null 表示该 provider 暂不支持（跳过）。
 function dispatchSnapshot(baseUrl, apiKey) {
   if (baseUrl.includes("deepseek")) return fetchDeepSeekBalance(baseUrl, apiKey);
-  // GLM 暂搁置（bigmodel.cn / z.ai）；启用时解开下一行即可。
-  // if (baseUrl.includes("bigmodel.cn") || baseUrl.includes("z.ai")) return fetchZhipuUsage(apiKey);
+  if (baseUrl.includes("bigmodel.cn") || baseUrl.includes("z.ai")) return fetchZhipuUsage(apiKey);
   return null;
 }
 
@@ -105,7 +104,7 @@ function formatRemaining(ms) {
 }
 
 async function fetchZhipuUsage(apiKey) {
-  const res = await fetch("https://api.z.ai/api/monitor/usage/quota/limit", {
+  const res = await fetch("https://open.bigmodel.cn/api/monitor/usage/quota/limit", {
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
@@ -115,31 +114,34 @@ async function fetchZhipuUsage(apiKey) {
   const body = await res.json();
   if (!body.success || !body.data?.limits) return null;
 
+  // GLM 返回多个 TOKENS_LIMIT 窗口：unit=3 number=5 是 5 小时窗口，unit=6 number=1 是周窗口。
+  // TIME_LIMIT 是 MCP 工具调用时间限制，不是 token 额度，不显示。
   const limits = body.data.limits;
-  const tokens = limits.find((l) => l.type === "TOKENS_LIMIT");
-  const time = limits.find((l) => l.type === "TIME_LIMIT");
+  const tokenLimits = limits.filter((l) => l.type === "TOKENS_LIMIT");
+  const fiveHour = tokenLimits.find((l) => l.unit === 3);
+  const sevenDay = tokenLimits.find((l) => l.unit === 6);
 
   const parts = [];
-  if (tokens) {
-    const reset = formatRemaining(tokens.nextResetTime - Date.now());
-    parts.push(`Tok ${tokens.percentage}%${reset ? ` ↻${reset}` : ""}`);
+  if (fiveHour) {
+    const reset = formatRemaining(fiveHour.nextResetTime - Date.now());
+    parts.push(`5h ${fiveHour.percentage}%${reset ? ` ↻${reset}` : ""}`);
   }
-  if (time) {
-    const reset = formatRemaining(time.nextResetTime - Date.now());
-    parts.push(`MCP ${time.percentage}%${reset ? ` ↻${reset}` : ""}`);
+  if (sevenDay) {
+    const reset = formatRemaining(sevenDay.nextResetTime - Date.now());
+    parts.push(`周 ${sevenDay.percentage}%${reset ? ` ↻${reset}` : ""}`);
   }
 
   return {
     five_hour: {
-      used_percentage: tokens?.percentage ?? null,
-      resets_at: tokens?.nextResetTime
-        ? new Date(tokens.nextResetTime).toISOString()
+      used_percentage: fiveHour?.percentage ?? null,
+      resets_at: fiveHour?.nextResetTime
+        ? new Date(fiveHour.nextResetTime).toISOString()
         : null,
     },
     seven_day: {
-      used_percentage: time?.percentage ?? null,
-      resets_at: time?.nextResetTime
-        ? new Date(time.nextResetTime).toISOString()
+      used_percentage: sevenDay?.percentage ?? null,
+      resets_at: sevenDay?.nextResetTime
+        ? new Date(sevenDay.nextResetTime).toISOString()
         : null,
     },
     balance_label: parts.join(" | ") || null,
