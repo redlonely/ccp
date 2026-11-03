@@ -1,194 +1,315 @@
 #!/usr/bin/env node
-// Fetch provider usage/balance and write claude-hud external snapshots.
-// 数据源：cc-switch.db 的 providers 表（claude app_type）。
-// 阶段1解耦：不再扫 ccp 写的 .current-*.json marker，直接读 db 拿所有 provider 的 token。
-import { writeFileSync, readFileSync, existsSync } from "node:fs";
+
+// Fetch third-party provider quota/balance data for claude-hud external usage.
+// Credentials stay in cc-switch.db; snapshots contain display data only.
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { join, dirname } from "node:path";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DS_DAILY = join(__dirname, "ds-daily.json");
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+const OUTPUT_DIR = process.env.CCP_USAGE_DIR || SCRIPT_DIR;
+const DB = process.env.CC_SWITCH_DB || join(homedir(), ".cc-switch", "cc-switch.db");
+const TIMEOUT_MS = Number(process.env.CCP_USAGE_TIMEOUT_MS || 10_000);
+const MIN_AGE_MS = Number(process.env.CCP_USAGE_MIN_AGE_MS || 45_000);
+const LOCK_DIR = join(OUTPUT_DIR, ".provider-usage.lock");
 
-// Local calendar date (YYYY-MM-DD) in the machine's timezone, not UTC.
 function todayDate() {
-  const d = new Date();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${d.getFullYear()}-${mm}-${dd}`;
+  const date = new Date();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${date.getFullYear()}-${month}-${day}`;
 }
 
-// Difference method for "today's usage": record today's opening balance on
-// first query of the day, then usage = opening - current. Cold start: the
-// first day under monitoring counts from the first query onward.
-function computeDailyUsage(currentBalance) {
-  const today = todayDate();
-  let daily = null;
+function safeName(value) {
+  const safe = String(value)
+    .normalize("NFKC")
+    .replace(/[^\p{L}\p{N}._-]+/gu, "_")
+    .replace(/^\.+/, "")
+    .replace(/_+/g, "_")
+    .slice(0, 80);
+  return safe || "provider";
+}
+
+function atomicWriteJson(path, value) {
+  const temporary = `${path}.tmp.${process.pid}`;
   try {
-    daily = JSON.parse(readFileSync(DS_DAILY, "utf-8"));
-  } catch {
-    daily = null;
-  }
-
-  let opening;
-  if (!daily || daily.date !== today) {
-    opening = currentBalance;
+    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    renameSync(temporary, path);
+    chmodSync(path, 0o600);
+  } catch (error) {
     try {
-      writeFileSync(DS_DAILY, JSON.stringify({ date: today, opening_balance: opening }, null, 2) + "\n");
+      unlinkSync(temporary);
     } catch {
-      // Best-effort persistence; usage just won't be comparable next run.
+      // Nothing to clean up.
     }
-  } else {
-    opening = Number(daily.opening_balance);
-    if (!Number.isFinite(opening)) opening = currentBalance;
+    throw error;
   }
-
-  // Clamp at 0: a top-up mid-day would otherwise show negative "usage".
-  return Math.max(0, opening - currentBalance);
 }
 
-// 按 baseUrl 分发到对应查询；返回 null 表示该 provider 暂不支持（跳过）。
-function dispatchSnapshot(baseUrl, apiKey) {
-  if (baseUrl.includes("deepseek")) return fetchDeepSeekBalance(baseUrl, apiKey);
-  if (baseUrl.includes("bigmodel.cn") || baseUrl.includes("z.ai")) return fetchZhipuUsage(apiKey);
-  return null;
+function snapshotPath(provider) {
+  return join(OUTPUT_DIR, `provider-usage-${safeName(provider.name)}.json`);
 }
 
-// 处理单个 provider：查额度 → 写 provider-usage-<name>.json。
-async function processProvider({ name, base_url, auth_token }) {
-  if (!name || !base_url || !auth_token) return;
-
-  const snapshot = await dispatchSnapshot(base_url, auth_token);
-  if (!snapshot) return;
-
-  const safe = String(name).replace(/\s+/g, "_");
-  writeFileSync(join(__dirname, `provider-usage-${safe}.json`), JSON.stringify(snapshot, null, 2) + "\n");
+function snapshotsAreFresh(providers) {
+  const now = Date.now();
+  return providers.every((provider) => {
+    try {
+      const snapshot = JSON.parse(readFileSync(snapshotPath(provider), "utf8"));
+      const updatedAt = Date.parse(snapshot.updated_at);
+      return Number.isFinite(updatedAt) && now - updatedAt < MIN_AGE_MS;
+    } catch {
+      return false;
+    }
+  });
 }
 
-// 从 cc-switch.db 读所有 claude provider 的 (name, base_url, auth_token)。
-// ponytail: execFileSync 调 sqlite3 -json，零依赖，避免 node:sqlite 实验性 API。
+function acquireLock() {
+  try {
+    mkdirSync(LOCK_DIR, { mode: 0o700 });
+    return true;
+  } catch {
+    try {
+      if (Date.now() - statSync(LOCK_DIR).mtimeMs > TIMEOUT_MS * 2) {
+        rmSync(LOCK_DIR, { recursive: true, force: true });
+        mkdirSync(LOCK_DIR, { mode: 0o700 });
+        return true;
+      }
+    } catch {
+      // Another process may have released the lock between checks.
+    }
+    return false;
+  }
+}
+
+function releaseLock() {
+  rmSync(LOCK_DIR, { recursive: true, force: true });
+}
+
 function readProvidersFromDb() {
-  const db = join(homedir(), ".cc-switch", "cc-switch.db");
-  if (!existsSync(db)) return [];
-  const sql = `SELECT name,
+  if (!existsSync(DB)) {
+    throw new Error(`cc-switch database not found: ${DB}`);
+  }
+  const sql = `SELECT id,
+                      name,
                       json_extract(settings_config, '$.env.ANTHROPIC_BASE_URL') AS base_url,
-                      json_extract(settings_config, '$.env.ANTHROPIC_AUTH_TOKEN') AS auth_token
+                      COALESCE(
+                        json_extract(settings_config, '$.env.ANTHROPIC_AUTH_TOKEN'),
+                        json_extract(settings_config, '$.env.ANTHROPIC_API_KEY')
+                      ) AS credential
                FROM providers
                WHERE app_type='claude'
                  AND base_url IS NOT NULL
-                 AND auth_token IS NOT NULL`;
-  let raw;
-  try {
-    raw = execFileSync("sqlite3", ["-json", db, sql], { encoding: "utf8" });
-  } catch {
-    return [];
-  }
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return [];
-  }
+                 AND credential IS NOT NULL`;
+  const raw = execFileSync("sqlite3", ["-json", DB, sql], { encoding: "utf8" });
+  return JSON.parse(raw || "[]");
 }
 
-function formatRemaining(ms) {
-  if (!ms || ms <= 0) return "";
-  const totalMin = Math.floor(ms / 60000);
-  if (totalMin < 60) return `${totalMin}m`;
-  const h = Math.floor(totalMin / 60);
-  const m = totalMin % 60;
-  if (h < 24) return m > 0 ? `${h}h${m}m` : `${h}h`;
-  const d = Math.floor(h / 24);
-  const rh = h % 24;
-  return rh > 0 ? `${d}d${rh}h` : `${d}d`;
+function providerKind(baseUrl) {
+  try {
+    const hostname = new URL(baseUrl).hostname.toLowerCase();
+    if (hostname === "api.deepseek.com" || hostname.endsWith(".deepseek.com")) return "deepseek";
+    if (hostname === "open.bigmodel.cn" || hostname.endsWith(".bigmodel.cn") || hostname === "api.z.ai" || hostname.endsWith(".z.ai")) return "glm";
+  } catch {
+    return null;
+  }
+  return null;
 }
 
-async function fetchZhipuUsage(apiKey) {
-  const res = await fetch("https://open.bigmodel.cn/api/monitor/usage/quota/limit", {
+async function fetchJson(url, credential) {
+  const response = await fetch(url, {
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${credential}`,
       "Content-Type": "application/json",
     },
-    signal: AbortSignal.timeout(10_000),
+    signal: AbortSignal.timeout(TIMEOUT_MS),
   });
-  const body = await res.json();
-  if (!body.success || !body.data?.limits) return null;
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} ${response.statusText}`);
+  }
+  try {
+    return await response.json();
+  } catch {
+    throw new Error("response is not valid JSON");
+  }
+}
 
-  // GLM 返回多个 TOKENS_LIMIT 窗口：unit=3 number=5 是 5 小时窗口，unit=6 number=1 是周窗口。
-  // TIME_LIMIT 是 MCP 工具调用时间限制，不是 token 额度，不显示。
-  const limits = body.data.limits;
-  const tokenLimits = limits.filter((l) => l.type === "TOKENS_LIMIT");
-  const fiveHour = tokenLimits.find((l) => l.unit === 3);
-  const sevenDay = tokenLimits.find((l) => l.unit === 6);
+function formatRemaining(milliseconds) {
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return "";
+  const totalMinutes = Math.floor(milliseconds / 60_000);
+  if (totalMinutes < 60) return `${totalMinutes}m`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours < 24) return minutes ? `${hours}h${minutes}m` : `${hours}h`;
+  const days = Math.floor(hours / 24);
+  const remainingHours = hours % 24;
+  return remainingHours ? `${days}d${remainingHours}h` : `${days}d`;
+}
+
+function computeDailyUsage(provider, currentBalance) {
+  const statePath = join(OUTPUT_DIR, `deepseek-daily-${safeName(provider.id)}.json`);
+  const today = todayDate();
+  let state = null;
+  try {
+    state = JSON.parse(readFileSync(statePath, "utf8"));
+  } catch {
+    state = null;
+  }
+
+  let opening = state?.date === today ? Number(state.opening_balance) : currentBalance;
+  if (!Number.isFinite(opening) || currentBalance > opening) opening = currentBalance;
+  atomicWriteJson(statePath, { date: today, opening_balance: opening });
+  return Math.max(0, opening - currentBalance);
+}
+
+async function fetchGlmUsage(credential) {
+  const body = await fetchJson("https://open.bigmodel.cn/api/monitor/usage/quota/limit", credential);
+  if (!body.success || !Array.isArray(body.data?.limits)) {
+    const detail = [body.code, body.msg || body.message].filter(Boolean).join(": ");
+    throw new Error(`unexpected GLM quota response${detail ? ` (${detail})` : ""}`);
+  }
+  const tokenLimits = body.data.limits.filter((limit) => limit.type === "TOKENS_LIMIT");
+  const fiveHour = tokenLimits.find((limit) => limit.unit === 3);
+  const sevenDay = tokenLimits.find((limit) => limit.unit === 6);
+  if (!fiveHour && !sevenDay) throw new Error("GLM token quota windows are missing");
 
   const parts = [];
-  if (fiveHour) {
-    const reset = formatRemaining(fiveHour.nextResetTime - Date.now());
-    parts.push(`5h ${fiveHour.percentage}%${reset ? ` in ${reset}` : ""}`);
+  for (const [label, limit] of [["5h", fiveHour], ["7d", sevenDay]]) {
+    if (!limit) continue;
+    const percentage = Number(limit.percentage);
+    if (!Number.isFinite(percentage)) continue;
+    const reset = formatRemaining(Number(limit.nextResetTime) - Date.now());
+    parts.push(`${label} [${percentage}%]${reset ? ` in ${reset}` : ""}`);
   }
-  if (sevenDay) {
-    const reset = formatRemaining(sevenDay.nextResetTime - Date.now());
-    parts.push(`7d ${sevenDay.percentage}%${reset ? ` in ${reset}` : ""}`);
-  }
-
-  return {
-    five_hour: {
-      used_percentage: fiveHour?.percentage ?? null,
-      resets_at: fiveHour?.nextResetTime
-        ? new Date(fiveHour.nextResetTime).toISOString()
-        : null,
-    },
-    seven_day: {
-      used_percentage: sevenDay?.percentage ?? null,
-      resets_at: sevenDay?.nextResetTime
-        ? new Date(sevenDay.nextResetTime).toISOString()
-        : null,
-    },
-    balance_label: parts.join(" | ") || null,
-    updated_at: new Date().toISOString(),
-  };
-}
-
-async function fetchDeepSeekBalance(baseUrl, apiKey) {
-  const balanceUrl = baseUrl.replace(/\/v1.*$/, "").replace(/\/anthropic.*$/, "") + "/v1/user/balance";
-  const res = await fetch(balanceUrl, {
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    signal: AbortSignal.timeout(10_000),
-  });
-  const body = await res.json();
-  if (!body.balance_infos?.length) return null;
-
-  const info = body.balance_infos[0];
-  const total = parseFloat(info.total_balance || "0");
-  const sym = info.currency === "CNY" ? "¥" : (info.currency || "¥");
-
-  const usedToday = computeDailyUsage(total);
-  const todayPart = usedToday > 0 ? ` | 今日 -${sym}${usedToday.toFixed(2)}` : "";
-
+  if (!parts.length) throw new Error("GLM quota percentages are invalid");
   return {
     five_hour: null,
     seven_day: null,
-    balance_label: `${sym}${total.toFixed(2)}${todayPart}`,
+    balance_label: parts.join(" | "),
     updated_at: new Date().toISOString(),
   };
 }
 
-async function main() {
-  // 数据源：cc-switch.db 的所有 claude provider（不再扫 ccp marker）。
-  // 每个 provider 各查写独立快照，claude-hud 按 stdin.model 路由显示。
-  const providers = readProvidersFromDb();
-  if (providers.length === 0) process.exit(0);
+async function fetchDeepSeekBalance(provider) {
+  const root = provider.base_url.replace(/\/v1.*$/, "").replace(/\/anthropic.*$/, "");
+  const body = await fetchJson(`${root}/v1/user/balance`, provider.credential);
+  if (!Array.isArray(body.balance_infos) || !body.balance_infos.length) {
+    throw new Error("unexpected DeepSeek balance response");
+  }
+  const info = body.balance_infos[0];
+  const total = Number.parseFloat(info.total_balance);
+  if (!Number.isFinite(total)) throw new Error("DeepSeek balance is invalid");
 
-  for (const p of providers) {
-    try {
-      await processProvider(p);
-    } catch {
-      // 单个 provider 失败不影响其他
-    }
+  const symbol = info.currency === "CNY" ? "¥" : (info.currency || "¥");
+  const usedToday = computeDailyUsage(provider, total);
+  const todayPart = usedToday > 0 ? ` | 今日 -${usedToday.toFixed(2)}${symbol}` : "";
+  return {
+    five_hour: null,
+    seven_day: null,
+    balance_label: `余额 ${total.toFixed(2)}${symbol}${todayPart}`,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+async function processProvider(provider) {
+  const kind = providerKind(provider.base_url);
+  if (!kind) return { name: provider.name, status: "unsupported" };
+  const snapshot = kind === "glm"
+    ? await fetchGlmUsage(provider.credential)
+    : await fetchDeepSeekBalance(provider);
+  const outputPath = snapshotPath(provider);
+  atomicWriteJson(outputPath, snapshot);
+  return { name: provider.name, status: "updated", outputPath };
+}
+
+function checkEnvironment() {
+  const providers = readProvidersFromDb();
+  const supported = providers.filter((provider) => providerKind(provider.base_url));
+  const hud = checkHudCompatibility();
+  console.log(`database: ${DB}`);
+  console.log(`output: ${OUTPUT_DIR}`);
+  console.log(`supported providers: ${supported.map((provider) => provider.name).join(", ") || "none"}`);
+  console.log(`claude-hud: ${hud.message}`);
+  if (!supported.length || !hud.compatible) process.exitCode = 1;
+}
+
+function checkHudCompatibility() {
+  const cacheRoot = join(homedir(), ".claude", "plugins", "cache", "claude-hud", "claude-hud");
+  try {
+    const versions = readdirSync(cacheRoot)
+      .filter((entry) => /^\d+\.\d+\.\d+$/.test(entry))
+      .sort((left, right) => {
+        const a = left.split(".").map(Number);
+        const b = right.split(".").map(Number);
+        return (a[0] - b[0]) || (a[1] - b[1]) || (a[2] - b[2]);
+      });
+    const latest = versions.at(-1);
+    if (!latest) return { compatible: false, message: "not installed" };
+    const configSource = readFileSync(join(cacheRoot, latest, "src", "config.ts"), "utf8");
+    const usageSource = readFileSync(join(cacheRoot, latest, "src", "external-usage.ts"), "utf8");
+    const compatible = configSource.includes("externalUsageByModel")
+      && usageSource.includes("externalUsageByModel");
+    return {
+      compatible,
+      message: compatible
+        ? `${latest} compatible`
+        : `${latest} missing externalUsageByModel support`,
+    };
+  } catch (error) {
+    return { compatible: false, message: `check failed: ${error.message}` };
   }
 }
 
-main().catch(() => process.exit(1));
+async function main() {
+  if (process.argv.includes("--check")) {
+    checkEnvironment();
+    return;
+  }
+
+  const providers = readProvidersFromDb();
+  const supported = providers.filter((provider) => providerKind(provider.base_url));
+  if (!supported.length) {
+    console.error("provider-usage: no supported providers found");
+    process.exitCode = 1;
+    return;
+  }
+
+  if (!process.argv.includes("--force") && snapshotsAreFresh(supported)) return;
+  if (!acquireLock()) return;
+
+  try {
+    const results = await Promise.allSettled(supported.map(processProvider));
+    let failures = 0;
+    results.forEach((result, index) => {
+      const name = supported[index].name;
+      if (result.status === "rejected") {
+        failures += 1;
+        console.error(`provider-usage: ${name}: ${result.reason?.message || result.reason}`);
+      }
+    });
+    if (failures) process.exitCode = 1;
+  } finally {
+    releaseLock();
+  }
+}
+
+main().catch((error) => {
+  console.error(`provider-usage: ${error.message || error}`);
+  process.exitCode = 1;
+});

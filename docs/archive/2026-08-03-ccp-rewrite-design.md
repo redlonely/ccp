@@ -1,7 +1,7 @@
 # ccp 重写设计 — 调用 cc-switch 官方 API + claude-hud 集成层
 
 **日期**: 2026-08-03
-**状态**: Draft（待主人复核）
+**状态**: Superseded（已由 cc-switch 5.10 原生启动流程取代；当前设计见 README）
 **作者**: claude + 主人
 
 ---
